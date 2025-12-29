@@ -1785,6 +1785,7 @@ get_acme_cert() {
     local domain=$1
     local protocol="${2:-unknown}"
     local cert_dir="$CFG/certs"
+    local use_dns_manual=false
     mkdir -p "$cert_dir"
     
     # 检查是否已有相同域名的证书
@@ -1819,9 +1820,10 @@ get_acme_cert() {
         echo -e "  ${Y}选项：${NC}"
         echo -e "  1) 使用自签证书 (安全性较低，易被识别)"
         echo -e "  2) 重新输入域名"
-        echo -e "  3) 退出安装"
+        echo -e "  3) 使用 DNS 手动验证申请证书 (无需 80/443 端口)"
+        echo -e "  4) 退出安装"
         echo ""
-        read -rp "  请选择 [1-3]: " choice
+        read -rp "  请选择 [1-4]: " choice
         
         case "$choice" in
             1)
@@ -1831,7 +1833,11 @@ get_acme_cert() {
             2)
                 return 2  # 返回特殊值，表示需要重新输入域名
                 ;;
-            3|"")
+            3)
+                _info "将使用 DNS 手动验证申请证书"
+                use_dns_manual=true
+                ;;
+            4|"")
                 _info "已退出安装"
                 exit 0
                 ;;
@@ -1844,13 +1850,29 @@ get_acme_cert() {
     
     # 域名解析通过，询问是否申请证书
     echo ""
-    _ok "域名解析验证通过！"
+    if [[ "$use_dns_manual" == "true" ]]; then
+        _warn "将使用 DNS 手动验证申请证书，A/AAAA 解析无需匹配本机"
+    else
+        _ok "域名解析验证通过！"
+    fi
     echo ""
     echo -e "  ${Y}接下来将申请 Let's Encrypt 证书：${NC}"
     echo -e "  • 域名: ${G}$domain${NC}"
     echo -e "  • 证书有效期: 90天 (自动续期)"
-    echo -e "  • 申请过程需要临时占用80端口"
+    if [[ "$use_dns_manual" == "true" ]]; then
+        echo -e "  • 验证方式: DNS 手动 (无需 80/443 端口)"
+        echo -e "  • 你需要在 DNS 中添加 TXT 记录完成验证"
+    else
+        echo -e "  • 申请过程需要临时占用80端口"
+    fi
     echo ""
+    if [[ "$use_dns_manual" == "false" ]]; then
+        echo -e "  ${G}可选:${NC} 选择 DNS 手动验证 (适用于 80/443 端口受限)"
+        read -rp "  是否改用 DNS 手动验证? [y/N]: " dns_choice
+        if [[ "$dns_choice" =~ ^[yY]$ ]]; then
+            use_dns_manual=true
+        fi
+    fi
     read -rp "  是否继续申请证书? [Y/n]: " confirm_cert
     
     if [[ "$confirm_cert" =~ ^[nN]$ ]]; then
@@ -1866,7 +1888,7 @@ get_acme_cert() {
     
     # 临时停止可能占用 80 端口的服务（兼容 Alpine/systemd）
     local nginx_was_running=false
-    if svc status nginx 2>/dev/null; then
+    if [[ "$use_dns_manual" == "false" ]] && svc status nginx 2>/dev/null; then
         nginx_was_running=true
         _info "临时停止 Nginx..."
         svc stop nginx
@@ -1882,11 +1904,22 @@ get_acme_cert() {
     # 构建 reloadcmd（兼容 systemd 和 OpenRC）
     local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt; chown root:root $cert_dir/server.key $cert_dir/server.crt; if command -v systemctl >/dev/null 2>&1; then systemctl restart vless-reality vless-hy2 vless-trojan 2>/dev/null || true; elif command -v rc-service >/dev/null 2>&1; then rc-service vless-reality restart 2>/dev/null || true; rc-service vless-hy2 restart 2>/dev/null || true; rc-service vless-trojan restart 2>/dev/null || true; fi"
     
-    # 使用 standalone 模式申请证书，显示实时进度
+    # 使用 standalone 或 DNS 手动模式申请证书，显示实时进度
     local acme_log="/tmp/acme_output.log"
     
     # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
-    if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    if [[ "$use_dns_manual" == "true" ]]; then
+        echo ""
+        _info "DNS 手动验证模式：请根据提示添加 TXT 记录后继续"
+        if "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+            true
+        else
+            false
+        fi
+    else
+        "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'
+    fi
+    if [[ $? -eq 0 ]]; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
@@ -1940,10 +1973,16 @@ get_acme_cert() {
         rm -f "$acme_log"
         echo ""
         _err "常见问题检查："
-        _err "  1. 域名是否正确解析到本机 IP: $server_ip"
-        _err "  2. 80 端口是否在防火墙中开放"
-        _err "  3. 域名是否已被其他证书占用"
-        _err "  4. 是否有其他程序占用80端口"
+        if [[ "$use_dns_manual" == "true" ]]; then
+            _err "  1. DNS TXT 记录是否正确添加 (等待解析生效)"
+            _err "  2. DNS 提供商是否有缓存延迟"
+            _err "  3. 域名是否已被其他证书占用"
+        else
+            _err "  1. 域名是否正确解析到本机 IP: $server_ip"
+            _err "  2. 80 端口是否在防火墙中开放"
+            _err "  3. 域名是否已被其他证书占用"
+            _err "  4. 是否有其他程序占用80端口"
+        fi
         echo ""
         _warn "回退到自签名证书模式..."
         return 1
