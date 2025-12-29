@@ -1849,7 +1849,7 @@ get_acme_cert() {
     echo -e "  ${Y}接下来将申请 Let's Encrypt 证书：${NC}"
     echo -e "  • 域名: ${G}$domain${NC}"
     echo -e "  • 证书有效期: 90天 (自动续期)"
-    echo -e "  • 申请过程需要临时占用80端口"
+    echo -e "  • 可选 HTTP-01 (占用 80 端口) 或 DNS-01 手动验证 (无需开放 80/443)"
     echo ""
     read -rp "  是否继续申请证书? [Y/n]: " confirm_cert
     
@@ -1858,21 +1858,43 @@ get_acme_cert() {
         return 2  # 返回特殊值，表示需要重新选择
     fi
     
+    # 选择证书申请方式
+    local issue_mode=""
+    while true; do
+        echo ""
+        echo -e "  ${W}证书申请方式${NC}"
+        echo -e "  ${G}1)${NC} HTTP-01 (自动占用 80 端口)"
+        echo -e "  ${G}2)${NC} DNS-01 手动验证 (适用于 80/443 不可用的 VPS)"
+        read -rp "  请选择 [1-2，默认 1]: " issue_mode
+        [[ -z "$issue_mode" ]] && issue_mode="1"
+        if [[ "$issue_mode" == "1" || "$issue_mode" == "2" ]]; then
+            break
+        fi
+        _err "无效选择: $issue_mode"
+    done
+
     # 用户确认后再安装 acme.sh
     _info "安装证书申请工具..."
     install_acme_tool || return 1
     
     local acme_sh="$HOME/.acme.sh/acme.sh"
     
-    # 临时停止可能占用 80 端口的服务（兼容 Alpine/systemd）
+    # 临时停止可能占用 80 端口的服务（仅 HTTP-01 模式需要）
     local nginx_was_running=false
-    if svc status nginx 2>/dev/null; then
-        nginx_was_running=true
-        _info "临时停止 Nginx..."
-        svc stop nginx
+    if [[ "$issue_mode" == "1" ]]; then
+        if svc status nginx 2>/dev/null; then
+            nginx_was_running=true
+            _info "临时停止 Nginx..."
+            svc stop nginx
+        fi
     fi
     
-    _info "正在为 $domain 申请证书 (Let's Encrypt)..."
+    if [[ "$issue_mode" == "1" ]]; then
+        _info "正在为 $domain 申请证书 (Let's Encrypt, HTTP-01)..."
+    else
+        _info "正在为 $domain 申请证书 (Let's Encrypt, DNS-01 手动验证)..."
+        echo -e "  ${Y}请根据提示添加 TXT 记录，并在完成后按回车继续${NC}"
+    fi
     echo ""
     
     # 获取服务器IP用于错误提示
@@ -1882,11 +1904,22 @@ get_acme_cert() {
     # 构建 reloadcmd（兼容 systemd 和 OpenRC）
     local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt; chown root:root $cert_dir/server.key $cert_dir/server.crt; if command -v systemctl >/dev/null 2>&1; then systemctl restart vless-reality vless-hy2 vless-trojan 2>/dev/null || true; elif command -v rc-service >/dev/null 2>&1; then rc-service vless-reality restart 2>/dev/null || true; rc-service vless-hy2 restart 2>/dev/null || true; rc-service vless-trojan restart 2>/dev/null || true; fi"
     
-    # 使用 standalone 模式申请证书，显示实时进度
+    # 使用不同模式申请证书，显示实时进度
     local acme_log="/tmp/acme_output.log"
-    
-    # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
-    if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    local issue_success=false
+
+    if [[ "$issue_mode" == "1" ]]; then
+        # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
+        if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+            issue_success=true
+        fi
+    else
+        if "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please 2>&1 | tee "$acme_log" | sed 's/^/  /'; then
+            issue_success=true
+        fi
+    fi
+
+    if [[ "$issue_success" == "true" ]]; then
         echo ""
         _ok "证书申请成功，安装证书..."
         
@@ -1941,9 +1974,15 @@ get_acme_cert() {
         echo ""
         _err "常见问题检查："
         _err "  1. 域名是否正确解析到本机 IP: $server_ip"
-        _err "  2. 80 端口是否在防火墙中开放"
-        _err "  3. 域名是否已被其他证书占用"
-        _err "  4. 是否有其他程序占用80端口"
+        if [[ "$issue_mode" == "1" ]]; then
+            _err "  2. 80 端口是否在防火墙中开放"
+            _err "  3. 域名是否已被其他证书占用"
+            _err "  4. 是否有其他程序占用80端口"
+        else
+            _err "  2. TXT 记录是否已正确添加并生效（DNS 解析可能有延迟）"
+            _err "  3. 是否添加到了正确的域名记录 (acme-challenge)"
+            _err "  4. 域名是否已被其他证书占用"
+        fi
         echo ""
         _warn "回退到自签名证书模式..."
         return 1
